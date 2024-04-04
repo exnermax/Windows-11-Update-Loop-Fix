@@ -1,0 +1,62 @@
+@ECHO OFF
+REM NAME: MetaCompWindows Update Fixer
+REM VERSION: 1.0
+REM BUILD DATE: 04 April 2024
+REM AUTHOR: Max Exner
+
+:: Überprüfung der Administratorrechte
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Administratorrechte nicht gefunden. Bitte als Administrator ausführen.
+    PAUSE
+    exit
+)
+
+echo.
+echo === Wilkommen zum Windows Update Loop Fixer ===
+echo.
+attrib -h -r -s "%windir%\system32\catroot2"
+attrib -h -r -s "%windir%\system32\catroot2\*.*"
+attrib -h -r -s "%windir%\SoftwareDistribution"
+attrib -h -r -s "%windir%\SoftwareDistribution\*.*"
+echo.
+echo === Stoppe laufende Update-Dienste ===
+echo.
+sc config wuauserv start= disabled
+net stop bits || echo Fehler beim Stoppen von BITS.
+net stop wuauserv || echo Fehler beim Stoppen von Windows Update.
+net stop appidsvc || echo Fehler beim Stoppen von AppID-Dienst.
+net stop cryptsvc || echo Fehler beim Stoppen von Kryptografiediensten.
+echo.
+echo === Lösche Verzeichnisse ===
+echo.
+rd /s /q "%windir%\SoftwareDistribution" || echo Fehler beim Löschen von SoftwareDistribution.
+rd /s /q "%windir%\System32\catroot2" || echo Fehler beim Löschen von catroot2.
+rd /s /q "%ALLUSERSPROFILE%\Application Data\Microsoft\Network\Downloader" || echo Fehler beim Löschen des Downloaders.
+Dism.exe /online /Cleanup-Image /StartComponentCleanup || echo Fehler beim Ausführen von DISM.
+echo.
+echo === Setze Update Dienst zurück ===
+echo.
+sc.exe sdset bits D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;AU)(A;;CCLCSWRPWPDTLOCRRC;;;PU)
+sc.exe sdset wuauserv D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;AU)(A;;CCLCSWRPWPDTLOCRRC;;;PU)
+echo.
+echo === Scanne nach Fehlern und behebe sie ===
+echo.
+sfc /SCANNOW || echo Fehler beim Ausführen von SFC.
+PAUSE
+echo.
+echo.
+echo === Starte Windows-Update Dienst ===
+echo.
+sc config wuauserv start= auto
+net start wuauserv || echo Fehler beim Starten von Windows Update.
+net start bits || echo Fehler beim Starten von BITS.
+net start appidsvc || echo Fehler beim Starten von AppID-Dienst.
+net start cryptSvc || echo Fehler beim Starten von Kryptografiediensten.
+echo.
+echo === Windows-Update Dienst wurde erfolgreich neu gestartet ===
+echo.
+echo.
+echo === WICHTIG STARTET SIE IHREN PC NEU ===
+echo.
+PAUSE
