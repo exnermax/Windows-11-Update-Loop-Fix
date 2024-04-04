@@ -13,7 +13,8 @@ Um diese Updates zu installieren oder dieses Skript auszuführen, sollte Windows
 ## Anleitung
 
 1. Laden Sie die neueste Version von [hier](https://github.com/exnermax/Windows-11-Update-Loop-Fix/releases/tag/untagged-57d7c4dfb5c8653aed76) herunter.
-2. Beenden Sie alle laufenden Anwendungen oder noch besser starten sie den PC im Abgesicherten Modus.
-3. Doppelklicken Sie auf die Datei Win11UpdateFix.exe und folgen Sie den Anweisungen.
+2. Endpacken sie die .zip Datei
+3. Beenden Sie alle laufenden Anwendungen oder noch besser starten sie den PC im Abgesicherten Modus.
+4. Doppelklicken Sie auf die Datei Win11UpdateFix.cmd und folgen Sie den Anweisungen.
 
 
