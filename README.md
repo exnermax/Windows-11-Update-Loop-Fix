@@ -1,4 +1,4 @@
-# Windows Update Loop Fix
+# Windows 11 Update Loop Fix
 
 > Ein automatisches Skript zur Behebung der Endlosschleife "Nach Updates wird gesucht" unter Windows 11 
 
