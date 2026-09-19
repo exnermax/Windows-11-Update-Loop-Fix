@@ -1,13 +1,13 @@
 @echo off
 REM ==============================================================
-REM  NAME:       Windows 11 Update Loop Fixer
+REM  NAME:       Windows 11 Update Loop Fix
 REM  VERSION:    2.0
 REM  BUILD DATE: 20 September 2026
 REM  AUTHOR:     Max Exner
 REM  LICENSE:    MIT
 REM
 REM  Arguments:
-REM    /y          Unattended: no prompts, no reboot
+REM    /y          Unattended: no prompts, no restart
 REM    /elevated   Internal: script was already relaunched as admin
 REM
 REM  All output is plain ASCII on purpose, so the script does not
@@ -15,13 +15,14 @@ REM  need to touch the console codepage.
 REM ==============================================================
 
 setlocal EnableExtensions EnableDelayedExpansion
-title Windows 11 Update Loop Fixer 2.0
+title Windows 11 Update Loop Fix 2.0
 
 set "LOGDIR=%ProgramData%\Win11UpdateFix"
 set "LOG=%LOGDIR%\Win11UpdateFix.log"
 set "STATE=%LOGDIR%\services.state"
 set "ERRORS=0"
 set "REBOOT=0"
+set "ROLLEDBACK="
 
 REM --- Unattended switch ----------------------------------------
 set "UNATTENDED="
@@ -39,7 +40,7 @@ if /i "%~1"=="/elevated" goto :no_admin
 set "PASSARGS=/elevated"
 if defined UNATTENDED set "PASSARGS=/elevated /y"
 echo.
-echo Requesting administrator rights - please confirm the UAC prompt.
+echo Requesting administrator rights - click Yes on the User Account Control prompt.
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%PASSARGS%' -Verb RunAs" >nul 2>&1
 if %errorlevel% neq 0 goto :no_admin
 exit /b 0
@@ -49,20 +50,21 @@ echo.
 echo   ERROR: This script requires administrator rights.
 echo   Right-click the file and choose "Run as administrator".
 echo.
-pause
+if not defined UNATTENDED pause
 exit /b 1
 
 :have_admin
 if not exist "%LOGDIR%" md "%LOGDIR%" >nul 2>&1
->"%LOG%" echo ===== Windows 11 Update Loop Fixer 2.0 =====
+>"%LOG%" echo ===== Windows 11 Update Loop Fix 2.0 =====
 >>"%LOG%" echo Start: %DATE% %TIME%
 >>"%LOG%" echo Computer: %COMPUTERNAME%  User: %USERNAME%
 
 REM --- Detect an aborted previous run and roll it back ----------
 if exist "%STATE%" (
     echo.
-    echo   NOTE: A previous run was aborted.
-    echo   Service start types are being restored first.
+    echo   NOTE: A previous run did not finish.
+    echo   Restoring the service start types first.
+    set "ROLLEDBACK=1"
     call :restore_state
 )
 
@@ -72,15 +74,15 @@ REM ==============================================================
 cls
 echo.
 echo  ============================================================
-echo   Windows 11 Update Loop Fixer  -  Version 2.0
+echo   Windows 11 Update Loop Fix  -  Version 2.0
 echo  ============================================================
 echo.
 echo   This script resets the Windows Update components:
-echo     - hung BITS transfers are discarded
+echo     - stuck download jobs are discarded
 echo     - SoftwareDistribution and catroot2 are renamed,
-echo       not deleted - a rollback stays possible
+echo       not deleted - so the change can be undone
 echo     - proxy and clock settings are cleaned up
-echo     - DISM and SFC repair the component store
+echo     - DISM repairs the component store, SFC the system files
 echo.
 echo   Log file: %LOG%
 echo.
@@ -99,30 +101,34 @@ for /f "tokens=3" %%v in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\Current
 set "DISPVER="
 for /f "tokens=3" %%v in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v DisplayVersion 2^>nul ^| findstr /i "REG_SZ"') do set "DISPVER=%%v"
 call :say "  System:       %OSNAME% %EDITION% %DISPVER% - build %BUILD%"
-if %BUILD% LSS 22000 call :warn "This is not Windows 11. The script also runs on Windows 10, but it is built for Windows 11."
+if %BUILD% LSS 22000 call :warn "This PC is running Windows 10. The script works here too, but it was written for Windows 11."
 
 REM --- Free disk space ------------------------------------------
-set "FREEGB=0"
+REM  Note: 0 is a valid reading on a nearly full drive, so an
+REM  unset variable and a zero must be told apart here.
+set "FREEGB="
 for /f "delims=" %%v in ('powershell -NoProfile -Command "[math]::Floor((Get-PSDrive -Name ($env:SystemDrive.Substring(0,1))).Free/1GB)" 2^>nul') do set "FREEGB=%%v"
-if "%FREEGB%"=="" set "FREEGB=0"
-if "%FREEGB%"=="0" goto :space_unknown
+if not defined FREEGB goto :space_unknown
+echo %FREEGB%| findstr /r "^[0-9][0-9]*$" >nul 2>&1
+if errorlevel 1 goto :space_unknown
 call :say "  Free space:   %FREEGB% GB on %SystemDrive%"
-if %FREEGB% LSS 20 call :warn "Less than 20 GB free. Windows 11 feature updates often need 20-30 GB and will fail without it."
+if %FREEGB% LSS 20 call :warn "Less than 20 GB free. Windows 11 feature updates usually need 20-30 GB and will fail if there is less. Free up space before trying again."
 goto :space_done
 :space_unknown
-call :say "  Free space:   could not be determined."
+call :say "  Free space:   unknown"
 :space_done
 
 REM --- WSUS / Windows Update policies ---------------------------
 reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" /v WUServer >nul 2>&1
-if %errorlevel% equ 0 call :warn "A WSUS server is set by group policy. If this PC is not on a company network, that is the most likely cause of the loop."
+if %errorlevel% equ 0 call :warn "A WSUS server is configured by Group Policy. If this PC is not on a company network, that is the most likely cause of the update loop."
 
-reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate >nul 2>&1
-if %errorlevel% equ 0 call :warn "A group policy disables automatic updates. Please check gpedit.msc."
+REM  Check the VALUE, not just its presence - NoAutoUpdate=0 is a
+REM  common leftover and means updates are switched ON.
+for /f "tokens=3" %%v in ('reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate 2^>nul ^| findstr /i "REG_DWORD"') do if /i "%%v"=="0x1" call :warn "A Group Policy disables automatic updates. Open gpedit.msc and look under Computer Configuration - Administrative Templates - Windows Components - Windows Update."
 
 REM --- System clock ---------------------------------------------
 call :say "  System time:  %DATE% %TIME%"
-call :say "  A wrong system clock is a common cause and is corrected automatically later on."
+call :say "  An incorrect clock is a common cause of update failures - the script resets it later."
 echo.
 
 if defined UNATTENDED goto :start_work
@@ -133,14 +139,18 @@ echo.
 :start_work
 
 REM ==============================================================
-REM  3. Discard hung BITS jobs - BITS is still running here
+REM  3. Discard stuck BITS jobs - BITS is still running here
 REM ==============================================================
-call :head "Discarding hung download jobs"
+call :head "Discarding stuck download jobs"
 bitsadmin /reset /allusers >>"%LOG%" 2>&1
 if %errorlevel% equ 0 goto :bits_ok
-powershell -NoProfile -Command "Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | Remove-BitsTransfer -ErrorAction SilentlyContinue" >>"%LOG%" 2>&1
+powershell -NoProfile -Command "Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | Remove-BitsTransfer -ErrorAction Stop" >>"%LOG%" 2>&1
+if %errorlevel% equ 0 goto :bits_ok
+call :say "  No download jobs could be read - continuing."
+goto :bits_done
 :bits_ok
-call :say "  BITS queue flushed."
+call :say "  Stuck download jobs discarded."
+:bits_done
 
 REM ==============================================================
 REM  4. Save start types and disable the services temporarily
@@ -175,8 +185,13 @@ del /f /q "%DLDIR%\qmgr*.db" >>"%LOG%" 2>&1
 call :say "  BITS database in the Downloader folder deleted."
 :dl_done
 
-powershell -NoProfile -Command "Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue" >>"%LOG%" 2>&1
+powershell -NoProfile -Command "if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) { Delete-DeliveryOptimizationCache -Force -ErrorAction Stop } else { exit 1 }" >>"%LOG%" 2>&1
+if %errorlevel% equ 0 goto :do_ok
+call :say "  Delivery Optimization cache not cleared - skipped."
+goto :do_done
+:do_ok
 call :say "  Delivery Optimization cache cleared."
+:do_done
 
 REM ==============================================================
 REM  6. Clean up network settings used by Windows Update
@@ -203,14 +218,14 @@ call :svc_start wuauserv
 del /f /q "%STATE%" >nul 2>&1
 
 REM ==============================================================
-REM  8. Synchronise the system clock
+REM  8. Synchronize the system clock
 REM ==============================================================
-call :head "Synchronising the system clock"
+call :head "Synchronizing the system clock"
 sc config w32time start= demand >>"%LOG%" 2>&1
 net start w32time >>"%LOG%" 2>&1
 w32tm /resync /force >>"%LOG%" 2>&1
 if %errorlevel% equ 0 goto :time_ok
-call :warn "Time sync failed. Please check date, time and time zone manually."
+call :warn "Time sync failed. Open Settings, then Time and language, and check the date, time and time zone yourself."
 goto :time_done
 :time_ok
 call :say "  Clock synced with the time server: %DATE% %TIME%"
@@ -227,18 +242,25 @@ set "RC=%errorlevel%"
 >>"%LOG%" echo [DISM RestoreHealth] exit code %RC%
 if "%RC%"=="0" call :say "  DISM: the component store is healthy."
 if "%RC%"=="3010" set "REBOOT=1"
-if "%RC%"=="3010" call :say "  DISM: repair succeeded, a reboot is required."
+if "%RC%"=="3010" call :say "  DISM: repair succeeded - a restart is required."
 if not "%RC%"=="0" if not "%RC%"=="3010" call :warn "DISM returned exit code %RC%. Details in %windir%\Logs\DISM\dism.log"
 
 echo.
 Dism.exe /Online /Cleanup-Image /StartComponentCleanup >>"%LOG%" 2>&1
+set "RC=%errorlevel%"
+>>"%LOG%" echo [DISM StartComponentCleanup] exit code %RC%
+if "%RC%"=="0" goto :cleanup_ok
+call :say "  Component store cleanup skipped - DISM exit code %RC%."
+goto :cleanup_done
+:cleanup_ok
 call :say "  Superseded update files removed from the component store."
+:cleanup_done
 
 REM ==============================================================
 REM  10. Check system files
 REM ==============================================================
 call :head "Checking system files"
-echo   This step takes a few minutes as well.
+echo   This step usually takes 5 to 15 minutes. Please do not cancel it either.
 echo.
 sfc /scannow
 set "RC=%errorlevel%"
@@ -247,7 +269,9 @@ if "%RC%"=="0" goto :sfc_ok
 call :warn "SFC returned exit code %RC%. Details in %windir%\Logs\CBS\CBS.log"
 goto :sfc_done
 :sfc_ok
-call :say "  SFC finished."
+REM  Exit code 0 covers both "nothing wrong" and "repaired it",
+REM  so the message must not claim either one.
+call :say "  SFC: system file check completed - details in CBS.log"
 :sfc_done
 
 REM ==============================================================
@@ -255,49 +279,65 @@ REM  11. Trigger an update scan
 REM ==============================================================
 call :head "Triggering an update scan"
 powershell -NoProfile -Command "(New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNow()" >>"%LOG%" 2>&1
-if %errorlevel% neq 0 "%windir%\System32\UsoClient.exe" StartScan >>"%LOG%" 2>&1
+if %errorlevel% equ 0 goto :scan_ok
+"%windir%\System32\UsoClient.exe" StartScan >>"%LOG%" 2>&1
+if %errorlevel% equ 0 goto :scan_ok
+call :say "  Could not start a scan - open Windows Update and check manually."
+goto :scan_done
+:scan_ok
 call :say "  Windows is now scanning for updates in the background."
+:scan_done
 
 REM ==============================================================
 REM  12. Summary
 REM ==============================================================
 echo.
 echo  ============================================================
-if "%ERRORS%"=="0" echo   DONE - every step completed without a warning.
-if not "%ERRORS%"=="0" echo   DONE - %ERRORS% warning(s), see the log file.
+if "%ERRORS%"=="0" echo   DONE - all steps completed with no warnings.
+if not "%ERRORS%"=="0" echo   DONE - %ERRORS% warning^(s^); see the log file.
 echo  ============================================================
 echo.
 echo   Log file:   %LOG%
 echo.
-echo   Rollback:   %windir%\SoftwareDistribution.bak
-echo               %windir%\System32\catroot2.bak
+
+set "HAVEBAK="
+if exist "%windir%\SoftwareDistribution.bak" set "HAVEBAK=1"
+if exist "%windir%\System32\catroot2.bak" set "HAVEBAK=1"
+if not defined HAVEBAK goto :nobak
+echo   Rollback:
+if exist "%windir%\SoftwareDistribution.bak" echo               %windir%\SoftwareDistribution.bak
+if exist "%windir%\System32\catroot2.bak" echo               %windir%\System32\catroot2.bak
 echo               These folders can be deleted once Windows
 echo               Update works again.
 echo.
-echo   IMPORTANT: Please reboot the PC so that all changes
+:nobak
+
+if "%REBOOT%"=="1" echo   NOTE: DISM needs a restart to finish its repair.
+echo   IMPORTANT: Please restart the PC so that all changes
 echo              take effect.
 echo.
 >>"%LOG%" echo End: %DATE% %TIME% - warnings: %ERRORS%
 
-if defined UNATTENDED goto :ende
-choice /c YN /n /m "  Reboot the PC now? [Y/N] "
-if errorlevel 2 goto :ende
-shutdown /r /t 30 /c "Reboot after the Windows Update repair"
+if defined UNATTENDED goto :done
+choice /c YN /n /m "  Restart the PC now? [Y/N] "
+if errorlevel 2 goto :done
+shutdown /r /t 30 /c "Restarting after Windows Update repair"
 echo.
-echo   The PC will reboot in 30 seconds.
+echo   The PC will restart in 30 seconds.
 echo   To cancel:  shutdown /a
 echo.
 
-:ende
+:done
 if not defined UNATTENDED pause
 endlocal
 exit /b 0
 
 :abort
 echo.
-echo   Aborted - no changes were made.
+echo   Aborted - the Windows Update reset was not started.
+if defined ROLLEDBACK echo   The service start types from the previous run were restored.
 del /f /q "%STATE%" >nul 2>&1
-pause
+if not defined UNATTENDED pause
 endlocal
 exit /b 0
 
@@ -329,9 +369,9 @@ goto :eof
 sc query "%~1" >nul 2>&1
 exit /b %errorlevel%
 
-REM  sc.exe localises its status text, so check the English and
-REM  German wording. This is about the Windows UI language, not
-REM  about the language of this script.
+REM  sc.exe localizes its status text, so check the English and
+REM  the German wording. This is about the Windows UI language,
+REM  not about the language of this script.
 :is_stopped
 sc query "%~1" 2>nul | findstr /i /c:"STOPPED" /c:"BEENDET" >nul 2>&1
 exit /b %errorlevel%
@@ -346,7 +386,7 @@ net stop %_svc% /y >>"%LOG%" 2>&1
 timeout /t 2 /nobreak >nul 2>&1
 call :is_stopped %_svc%
 if %errorlevel% equ 0 goto :svc_stop_done
-call :warn "Service %_svc% cannot be stopped. Please run the script again in Safe Mode."
+call :warn "Service %_svc% could not be stopped. Please run the script again in Safe Mode."
 goto :eof
 :svc_stop_done
 call :say "  Service %_svc% stopped."
@@ -359,7 +399,7 @@ if %errorlevel% neq 0 goto :eof
 net start %_svc% >>"%LOG%" 2>&1
 call :is_stopped %_svc%
 if %errorlevel% neq 0 goto :svc_start_ok
-call :warn "Service %_svc% is not running yet. It usually starts automatically after the reboot."
+call :warn "Service %_svc% is not running yet. It usually starts automatically after the next restart."
 goto :eof
 :svc_start_ok
 call :say "  Service %_svc% started."
@@ -371,7 +411,7 @@ set "_svc=%~1"
 call :svc_exists %_svc%
 if %errorlevel% neq 0 goto :eof
 net start %_svc% >>"%LOG%" 2>&1
-call :say "  Service %_svc% released."
+call :say "  Service %_svc% start requested - it starts on demand."
 goto :eof
 
 REM --- Read the start type from the registry: language neutral --
@@ -409,7 +449,7 @@ for /f "usebackq tokens=1,2 delims==" %%a in ("%STATE%") do sc config %%a start=
 del /f /q "%STATE%" >nul 2>&1
 goto :eof
 
-REM --- Rename instead of delete, so a rollback stays possible ---
+REM --- Rename instead of delete, so the change can be undone ----
 :reset_folder
 set "_path=%~1"
 set "_name=%~2"
