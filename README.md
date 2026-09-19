@@ -25,7 +25,7 @@ REM unattended: no prompts, no reboot
 Win11UpdateFix.cmd /y
 ```
 
-DISM and SFC take a while on a damaged component store. When it finishes it triggers an update scan, prints a summary and offers a reboot. Console output is in German.
+DISM and SFC take a while on a damaged component store. When it finishes it triggers an update scan, prints a summary and offers a reboot.
 
 ## Log and rollback
 
