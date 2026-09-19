@@ -1,62 +1,438 @@
-@ECHO OFF
-REM NAME: Update Fixer
-REM VERSION: 1.0
-REM BUILD DATE: 04 April 2024
-REM AUTHOR: Max Exner
+@echo off
+REM ==============================================================
+REM  NAME:       Windows 11 Update Loop Fixer
+REM  VERSION:    2.0
+REM  BUILD DATE: 20 September 2026
+REM  AUTHOR:     Max Exner
+REM  LIZENZ:     MIT
+REM
+REM  Parameter:
+REM    /y          Keine Rückfragen, läuft komplett durch
+REM    /elevated   Intern: Skript wurde bereits erhöht gestartet
+REM ==============================================================
 
-:: Überprüfung der Administratorrechte
+setlocal EnableExtensions EnableDelayedExpansion
+title Windows 11 Update Loop Fixer 2.0
+
+REM --- Codepage sichern und auf UTF-8 umstellen (Umlaute) -------
+set "OLDCP=850"
+for /f "tokens=2 delims=:" %%a in ('chcp') do set "OLDCP=%%a"
+set "OLDCP=%OLDCP: =%"
+set "OLDCP=%OLDCP:.=%"
+chcp 65001 >nul 2>&1
+
+set "LOGDIR=%ProgramData%\Win11UpdateFix"
+set "LOG=%LOGDIR%\Win11UpdateFix.log"
+set "STATE=%LOGDIR%\services.state"
+set "ERRORS=0"
+set "REBOOT=0"
+
+REM --- Unattended-Schalter --------------------------------------
+set "UNATTENDED="
+echo %* | findstr /i /c:"/y" >nul 2>&1 && set "UNATTENDED=1"
+
+REM ==============================================================
+REM  1. Administratorrechte prüfen / anfordern
+REM ==============================================================
+fltmc >nul 2>&1
+if %errorlevel% equ 0 goto :have_admin
 net session >nul 2>&1
-if %errorlevel% neq 0 (
-    echo Administratorrechte nicht gefunden. Bitte als Administrator ausführen.
-    PAUSE
-    exit
+if %errorlevel% equ 0 goto :have_admin
+
+if /i "%~1"=="/elevated" goto :no_admin
+set "PASSARGS=/elevated"
+if defined UNATTENDED set "PASSARGS=/elevated /y"
+echo.
+echo Administratorrechte werden angefordert - bitte die UAC-Abfrage bestätigen.
+powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%PASSARGS%' -Verb RunAs" >nul 2>&1
+if %errorlevel% neq 0 goto :no_admin
+exit /b 0
+
+:no_admin
+echo.
+echo   FEHLER: Dieses Skript benötigt Administratorrechte.
+echo   Rechtsklick auf die Datei - "Als Administrator ausführen".
+echo.
+pause
+chcp %OLDCP% >nul 2>&1
+exit /b 1
+
+:have_admin
+if not exist "%LOGDIR%" md "%LOGDIR%" >nul 2>&1
+>"%LOG%" echo ===== Windows 11 Update Loop Fixer 2.0 =====
+>>"%LOG%" echo Start: %DATE% %TIME%
+>>"%LOG%" echo Computer: %COMPUTERNAME%  Benutzer: %USERNAME%
+
+REM --- Abgebrochenen Vorlauf erkennen und zurückrollen ---------
+if exist "%STATE%" (
+    echo.
+    echo   HINWEIS: Ein früherer Lauf wurde abgebrochen.
+    echo   Die Startarten der Dienste werden zuerst wiederhergestellt.
+    call :restore_state
 )
 
+REM ==============================================================
+REM  2. Begrüßung und Vorab-Diagnose
+REM ==============================================================
+cls
 echo.
-echo === Wilkommen zum Windows Update Loop Fixer ===
+echo  ============================================================
+echo   Willkommen zum Windows 11 Update Loop Fixer  -  Version 2.0
+echo  ============================================================
 echo.
-attrib -h -r -s "%windir%\system32\catroot2"
-attrib -h -r -s "%windir%\system32\catroot2\*.*"
-attrib -h -r -s "%windir%\SoftwareDistribution"
-attrib -h -r -s "%windir%\SoftwareDistribution\*.*"
+echo   Dieses Skript setzt die Windows-Update-Komponenten zurück:
+echo     - hängende BITS-Übertragungen werden verworfen
+echo     - SoftwareDistribution und catroot2 werden umbenannt,
+echo       nicht gelöscht - ein Rollback bleibt möglich
+echo     - Proxy- und Zeiteinstellungen werden bereinigt
+echo     - DISM und SFC reparieren das Komponentenlager
 echo.
-echo === Stoppe laufende Update-Dienste ===
+echo   Protokoll: %LOG%
 echo.
-sc config wuauserv start= disabled
-net stop bits || echo Fehler beim Stoppen von BITS.
-net stop wuauserv || echo Fehler beim Stoppen von Windows Update.
-net stop appidsvc || echo Fehler beim Stoppen von AppID-Dienst.
-net stop cryptsvc || echo Fehler beim Stoppen von Kryptografiediensten.
+
+call :head "Vorab-Diagnose"
+
+REM --- Windows-Version ------------------------------------------
+set "BUILD=0"
+for /f "tokens=3" %%v in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v CurrentBuildNumber 2^>nul ^| findstr /i "REG_SZ"') do set "BUILD=%%v"
+REM  ProductName meldet unter Windows 11 weiterhin "Windows 10" -
+REM  die Version wird deshalb aus der Build-Nummer abgeleitet.
+set "OSNAME=Windows 10"
+if %BUILD% GEQ 22000 set "OSNAME=Windows 11"
+set "EDITION="
+for /f "tokens=3" %%v in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v EditionID 2^>nul ^| findstr /i "REG_SZ"') do set "EDITION=%%v"
+set "DISPVER="
+for /f "tokens=3" %%v in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v DisplayVersion 2^>nul ^| findstr /i "REG_SZ"') do set "DISPVER=%%v"
+call :say "  System:        %OSNAME% %EDITION% %DISPVER% - Build %BUILD%"
+if %BUILD% LSS 22000 call :warn "Kein Windows 11 erkannt. Das Skript läuft auch unter Windows 10, ist aber für Windows 11 ausgelegt."
+
+REM --- Freier Speicherplatz -------------------------------------
+set "FREEGB=0"
+for /f "delims=" %%v in ('powershell -NoProfile -Command "[math]::Floor((Get-PSDrive -Name ($env:SystemDrive.Substring(0,1))).Free/1GB)" 2^>nul') do set "FREEGB=%%v"
+if "%FREEGB%"=="" set "FREEGB=0"
+if "%FREEGB%"=="0" goto :space_unknown
+call :say "  Freier Platz:  %FREEGB% GB auf %SystemDrive%"
+if %FREEGB% LSS 20 call :warn "Weniger als 20 GB frei. Funktionsupdates von Windows 11 brauchen oft 20-30 GB und schlagen sonst fehl."
+goto :space_done
+:space_unknown
+call :say "  Freier Platz:  konnte nicht ermittelt werden."
+:space_done
+
+REM --- WSUS- / Update-Richtlinien -------------------------------
+reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" /v WUServer >nul 2>&1
+if %errorlevel% equ 0 call :warn "Per Richtlinie ist ein WSUS-Server eingetragen. Wenn dieser PC nicht in einem Firmennetz hängt, ist das die wahrscheinlichste Ursache der Endlosschleife."
+
+reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate >nul 2>&1
+if %errorlevel% equ 0 call :warn "Eine Richtlinie deaktiviert automatische Updates. Bitte in gpedit.msc prüfen."
+
+REM --- Systemzeit -----------------------------------------------
+call :say "  Systemzeit:    %DATE% %TIME%"
+call :say "  Eine falsche Systemzeit ist eine häufige Ursache und wird später automatisch korrigiert."
 echo.
-echo === Lösche Verzeichnisse ===
+
+if defined UNATTENDED goto :start_work
+choice /c JN /n /m "  Sollen die Update-Komponenten jetzt zurückgesetzt werden? [J/N] "
+if errorlevel 2 goto :abort
 echo.
-rd /s /q "%windir%\SoftwareDistribution" || echo Fehler beim Löschen von SoftwareDistribution.
-rd /s /q "%windir%\System32\catroot2" || echo Fehler beim Löschen von catroot2.
-rd /s /q "%ALLUSERSPROFILE%\Application Data\Microsoft\Network\Downloader" || echo Fehler beim Löschen des Downloaders.
-Dism.exe /online /Cleanup-Image /StartComponentCleanup || echo Fehler beim Ausführen von DISM.
+
+:start_work
+
+REM ==============================================================
+REM  3. Hängende BITS-Aufträge verwerfen - BITS läuft noch
+REM ==============================================================
+call :head "Hängende Download-Aufträge werden verworfen"
+bitsadmin /reset /allusers >>"%LOG%" 2>&1
+if %errorlevel% equ 0 goto :bits_ok
+powershell -NoProfile -Command "Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | Remove-BitsTransfer -ErrorAction SilentlyContinue" >>"%LOG%" 2>&1
+:bits_ok
+call :say "  BITS-Warteschlange geleert."
+
+REM ==============================================================
+REM  4. Startart sichern und Dienste vorübergehend deaktivieren
+REM ==============================================================
+call :head "Update-Dienste werden angehalten"
+call :save_start usosvc
+call :save_start dosvc
+call :save_start wuauserv
+call :save_start bits
+
+for %%s in (usosvc dosvc wuauserv bits) do sc config %%s start= disabled >>"%LOG%" 2>&1
+
+call :svc_stop usosvc
+call :svc_stop dosvc
+call :svc_stop wuauserv
+call :svc_stop bits
+call :svc_stop appidsvc
+call :svc_stop cryptsvc
+
+REM ==============================================================
+REM  5. Update-Caches zurücksetzen
+REM ==============================================================
+call :head "Update-Caches werden zurückgesetzt"
+
+call :reset_folder "%windir%\SoftwareDistribution" "SoftwareDistribution"
+call :reset_folder "%windir%\System32\catroot2" "catroot2"
+
+set "DLDIR=%ProgramData%\Microsoft\Network\Downloader"
+if not exist "%DLDIR%" goto :dl_done
+del /f /q "%DLDIR%\qmgr*.dat" >>"%LOG%" 2>&1
+del /f /q "%DLDIR%\qmgr*.db" >>"%LOG%" 2>&1
+call :say "  BITS-Datenbank im Downloader-Ordner gelöscht."
+:dl_done
+
+powershell -NoProfile -Command "Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue" >>"%LOG%" 2>&1
+call :say "  Cache der Übermittlungsoptimierung geleert."
+
+REM ==============================================================
+REM  6. Netzwerkeinstellungen für Windows Update bereinigen
+REM ==============================================================
+call :head "Netzwerkeinstellungen werden bereinigt"
+netsh winhttp reset proxy >>"%LOG%" 2>&1
+netsh winhttp reset tracing >>"%LOG%" 2>&1
+call :say "  WinHTTP-Proxy zurückgesetzt."
+
+REM ==============================================================
+REM  7. Dienste wieder aktivieren und starten
+REM ==============================================================
+call :head "Dienste werden wieder gestartet"
+call :restore_start bits
+call :restore_start wuauserv
+call :restore_start dosvc
+call :restore_start usosvc
+
+call :svc_start cryptsvc
+call :svc_start_quiet appidsvc
+call :svc_start bits
+call :svc_start wuauserv
+
+del /f /q "%STATE%" >nul 2>&1
+
+REM ==============================================================
+REM  8. Systemzeit synchronisieren
+REM ==============================================================
+call :head "Systemzeit wird synchronisiert"
+sc config w32time start= demand >>"%LOG%" 2>&1
+net start w32time >>"%LOG%" 2>&1
+w32tm /resync /force >>"%LOG%" 2>&1
+if %errorlevel% equ 0 goto :time_ok
+call :warn "Zeitabgleich fehlgeschlagen. Bitte Datum, Uhrzeit und Zeitzone manuell prüfen."
+goto :time_done
+:time_ok
+call :say "  Zeit mit dem Zeitserver abgeglichen: %DATE% %TIME%"
+:time_done
+
+REM ==============================================================
+REM  9. Komponentenlager reparieren - DISM vor SFC
+REM ==============================================================
+call :head "Komponentenlager wird geprüft und repariert"
+echo   Dieser Schritt kann 10-30 Minuten dauern. Bitte nicht abbrechen.
 echo.
-echo === Setze Update Dienst zurück ===
+Dism.exe /Online /Cleanup-Image /RestoreHealth
+set "RC=%errorlevel%"
+>>"%LOG%" echo [DISM RestoreHealth] Exitcode %RC%
+if "%RC%"=="0" call :say "  DISM: Komponentenlager ist in Ordnung."
+if "%RC%"=="3010" set "REBOOT=1"
+if "%RC%"=="3010" call :say "  DISM: Reparatur erfolgreich, Neustart erforderlich."
+if not "%RC%"=="0" if not "%RC%"=="3010" call :warn "DISM meldete Exitcode %RC%. Details in %windir%\Logs\DISM\dism.log"
+
 echo.
-sc.exe sdset bits D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;AU)(A;;CCLCSWRPWPDTLOCRRC;;;PU)
-sc.exe sdset wuauserv D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;AU)(A;;CCLCSWRPWPDTLOCRRC;;;PU)
+Dism.exe /Online /Cleanup-Image /StartComponentCleanup >>"%LOG%" 2>&1
+call :say "  Veraltete Update-Dateien aus dem Komponentenlager entfernt."
+
+REM ==============================================================
+REM  10. Systemdateien prüfen
+REM ==============================================================
+call :head "Systemdateien werden geprüft"
+echo   Auch dieser Schritt dauert einige Minuten.
 echo.
-echo === Scanne nach Fehlern und behebe sie ===
+sfc /scannow
+set "RC=%errorlevel%"
+>>"%LOG%" echo [SFC scannow] Exitcode %RC%
+if "%RC%"=="0" goto :sfc_ok
+call :warn "SFC meldete Exitcode %RC%. Details in %windir%\Logs\CBS\CBS.log"
+goto :sfc_done
+:sfc_ok
+call :say "  SFC abgeschlossen."
+:sfc_done
+
+REM ==============================================================
+REM  11. Update-Suche anstossen
+REM ==============================================================
+call :head "Update-Suche wird angestoßen"
+powershell -NoProfile -Command "(New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNow()" >>"%LOG%" 2>&1
+if %errorlevel% neq 0 "%windir%\System32\UsoClient.exe" StartScan >>"%LOG%" 2>&1
+call :say "  Windows sucht im Hintergrund nach Updates."
+
+REM ==============================================================
+REM  12. Zusammenfassung
+REM ==============================================================
 echo.
-sfc /SCANNOW || echo Fehler beim Ausführen von SFC.
-PAUSE
+echo  ============================================================
+if "%ERRORS%"=="0" echo   FERTIG - alle Schritte ohne Warnung ausgeführt.
+if not "%ERRORS%"=="0" echo   FERTIG - es gab %ERRORS% Warnung(en), siehe Protokoll.
+echo  ============================================================
 echo.
+echo   Protokoll:  %LOG%
 echo.
-echo === Starte Windows-Update Dienst ===
+echo   Rollback:   %windir%\SoftwareDistribution.bak
+echo               %windir%\System32\catroot2.bak
+echo               Diese Ordner können nach einem erfolgreichen
+echo               Update-Durchlauf gelöscht werden.
 echo.
-sc config wuauserv start= auto
-net start wuauserv || echo Fehler beim Starten von Windows Update.
-net start bits || echo Fehler beim Starten von BITS.
-net start appidsvc || echo Fehler beim Starten von AppID-Dienst.
-net start cryptSvc || echo Fehler beim Starten von Kryptografiediensten.
+echo   WICHTIG: Bitte starten Sie den PC neu, damit alle
+echo            Änderungen wirksam werden.
 echo.
-echo === Windows-Update Dienst wurde erfolgreich neu gestartet ===
+>>"%LOG%" echo Ende: %DATE% %TIME% - Warnungen: %ERRORS%
+
+if defined UNATTENDED goto :ende
+choice /c JN /n /m "  PC jetzt neu starten? [J/N] "
+if errorlevel 2 goto :ende
+shutdown /r /t 30 /c "Neustart nach der Windows-Update-Reparatur"
 echo.
+echo   Der PC startet in 30 Sekunden neu.
+echo   Abbrechen mit:  shutdown /a
 echo.
-echo === WICHTIG STARTET SIE IHREN PC NEU ===
+
+:ende
+chcp %OLDCP% >nul 2>&1
+if not defined UNATTENDED pause
+endlocal
+exit /b 0
+
+:abort
 echo.
-PAUSE
+echo   Abgebrochen - es wurden keine Änderungen vorgenommen.
+del /f /q "%STATE%" >nul 2>&1
+chcp %OLDCP% >nul 2>&1
+pause
+endlocal
+exit /b 0
+
+
+REM ==============================================================
+REM  Hilfsroutinen
+REM ==============================================================
+
+:say
+echo %~1
+>>"%LOG%" echo [%TIME%] %~1
+goto :eof
+
+:head
+echo.
+echo  --- %~1 ---
+echo.
+>>"%LOG%" echo.
+>>"%LOG%" echo [%TIME%] === %~1 ===
+goto :eof
+
+:warn
+echo   WARNUNG: %~1
+>>"%LOG%" echo [%TIME%] WARNUNG: %~1
+set /a ERRORS+=1
+goto :eof
+
+:svc_exists
+sc query "%~1" >nul 2>&1
+exit /b %errorlevel%
+
+:is_stopped
+sc query "%~1" 2>nul | findstr /i /c:"STOPPED" /c:"BEENDET" >nul 2>&1
+exit /b %errorlevel%
+
+:svc_stop
+set "_svc=%~1"
+call :svc_exists %_svc%
+if %errorlevel% neq 0 goto :eof
+call :is_stopped %_svc%
+if %errorlevel% equ 0 goto :svc_stop_done
+net stop %_svc% /y >>"%LOG%" 2>&1
+timeout /t 2 /nobreak >nul 2>&1
+call :is_stopped %_svc%
+if %errorlevel% equ 0 goto :svc_stop_done
+call :warn "Dienst %_svc% lässt sich nicht anhalten. Bitte das Skript im abgesicherten Modus erneut ausführen."
+goto :eof
+:svc_stop_done
+call :say "  Dienst %_svc% angehalten."
+goto :eof
+
+:svc_start
+set "_svc=%~1"
+call :svc_exists %_svc%
+if %errorlevel% neq 0 goto :eof
+net start %_svc% >>"%LOG%" 2>&1
+call :is_stopped %_svc%
+if %errorlevel% neq 0 goto :svc_start_ok
+call :warn "Dienst %_svc% läuft noch nicht. Er startet üblicherweise nach dem Neustart automatisch."
+goto :eof
+:svc_start_ok
+call :say "  Dienst %_svc% gestartet."
+goto :eof
+
+REM --- Start ohne Warnung: fuer trigger-gestartete Dienste ------
+:svc_start_quiet
+set "_svc=%~1"
+call :svc_exists %_svc%
+if %errorlevel% neq 0 goto :eof
+net start %_svc% >>"%LOG%" 2>&1
+call :say "  Dienst %_svc% freigegeben."
+goto :eof
+
+REM --- Startart aus der Registry lesen: sprachunabhängig --------
+:save_start
+set "_svc=%~1"
+call :svc_exists %_svc%
+if %errorlevel% neq 0 goto :eof
+set "_raw="
+set "_delay="
+for /f "tokens=3" %%v in ('reg query "HKLM\SYSTEM\CurrentControlSet\Services\%_svc%" /v Start 2^>nul ^| findstr /i "REG_DWORD"') do set "_raw=%%v"
+for /f "tokens=3" %%v in ('reg query "HKLM\SYSTEM\CurrentControlSet\Services\%_svc%" /v DelayedAutostart 2^>nul ^| findstr /i "REG_DWORD"') do set "_delay=%%v"
+set "_mode="
+if /i "%_raw%"=="0x2" set "_mode=auto"
+if /i "%_raw%"=="0x3" set "_mode=demand"
+if /i "%_raw%"=="0x4" set "_mode=demand"
+if /i "%_raw%"=="0x2" if /i "%_delay%"=="0x1" set "_mode=delayed-auto"
+if not defined _mode set "_mode=demand"
+>>"%STATE%" echo %_svc%=%_mode%
+set "START_%_svc%=%_mode%"
+>>"%LOG%" echo [%TIME%] Startart gesichert: %_svc% = %_mode%
+goto :eof
+
+:restore_start
+set "_svc=%~1"
+call :svc_exists %_svc%
+if %errorlevel% neq 0 goto :eof
+set "_mode=!START_%_svc%!"
+if not defined _mode goto :eof
+sc config %_svc% start= !_mode! >>"%LOG%" 2>&1
+>>"%LOG%" echo [%TIME%] Startart wiederhergestellt: %_svc% = !_mode!
+goto :eof
+
+:restore_state
+for /f "usebackq tokens=1,2 delims==" %%a in ("%STATE%") do sc config %%a start= %%b >>"%LOG%" 2>&1
+del /f /q "%STATE%" >nul 2>&1
+goto :eof
+
+REM --- Ordner umbenennen statt löschen: Rollback bleibt möglich
+:reset_folder
+set "_path=%~1"
+set "_name=%~2"
+if exist "%_path%" goto :rf_go
+call :say "  %_name% nicht vorhanden - übersprungen."
+goto :eof
+:rf_go
+attrib -h -r -s "%_path%" >nul 2>&1
+attrib -h -r -s "%_path%\*" /s /d >nul 2>&1
+if exist "%_path%.bak" rd /s /q "%_path%.bak" >nul 2>&1
+ren "%_path%" "%_name%.bak" >>"%LOG%" 2>&1
+if exist "%_path%" goto :rf_fallback
+call :say "  %_name% umbenannt nach %_name%.bak - Windows legt den Ordner neu an."
+goto :eof
+:rf_fallback
+rd /s /q "%_path%" >>"%LOG%" 2>&1
+if exist "%_path%" goto :rf_failed
+call :say "  %_name% gelöscht."
+goto :eof
+:rf_failed
+call :warn "%_name% ist gesperrt und konnte nicht zurückgesetzt werden. Bitte im abgesicherten Modus erneut ausführen."
+goto :eof
